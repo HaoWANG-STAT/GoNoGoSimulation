@@ -1,0 +1,898 @@
+---
+title: "Exploration of BP44551 CRP data - reanalysis based on a larger dataset"
+format: html
+toc: true
+toc-depth: 3
+toc-location: left
+toc-expand: true
+reference-location: margin
+embed-resources: TRUE
+params:
+  password: "Hktksd2007"
+---
+
+```{r}
+#| label: set-up
+#| echo: FALSE
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(knitr)
+  library(kableExtra)
+  library(mvtnorm)
+  library(here)
+  library(parallel)
+  library(rice)
+  library(ggpubr)
+  library(blandr)
+  library(irr)
+  library(psych)
+  library(patchwork)
+  library(plotly)
+  library(corrplot)
+  library(ggcompare)
+})
+
+source("functions.R", echo = FALSE)
+```
+
+# Raw data of BP44551
+
+```{r}
+#| label: read dataset from entimice
+#| echo: false
+#| eval: true
+
+# bme and crp dataset
+rice::rice_session(
+  {
+    path <- "root/clinical_studies/RO7486967/CDT71057/BP44551/publish/noncrf/prod/"
+    bme <- rice::rice_read(paste0(path, "/bme1_p_o_20241204051246.sas7bdat")) %>% 
+      select(PATNUM, ACCSNM, VISIT)
+    crp <- rice::rice_read(paste0(path, "/lab4_p_o_20241202042313.sas7bdat")) %>% 
+      filter(LABTSTL=="C_REACTIVE_PROTEIN")
+    rice::rice_ls(path) #directory information/files and folders in path
+  },
+  password = if (is.null(params) || is.null(params$password) || params$password == "") {
+    rstudioapi::askForPassword()
+  } else {
+    params$password
+  }
+)
+
+
+# il1beta dataset
+rice::rice_session(
+  {
+    path <- "root/clinical_studies/RO7486967/CDT71057/BP44551/publish/noncrf/restricted/prod/"
+    il1b <-rice::rice_read(paste0(path, "/exl5_p_r_20241108130724.sas7bdat")) #read in data
+    rice::rice_ls(path) #directory information/files and folders in path
+  },
+  password = if (is.null(params) || is.null(params$password) || params$password == "") {
+    rstudioapi::askForPassword()
+  } else {
+    params$password
+  }
+)
+
+
+```
+
+## IL1B data
+
+Note: Patient 10016 does not have IL1beta result on D1.
+
+```{r }
+#| echo: FALSE
+#| warning: false
+
+# il1b merge with bme to get visit information
+d <- il1b %>% select(PATNUM, ACCSNM, LABRESN) %>% 
+  left_join(bme, join_by(PATNUM, ACCSNM)) %>% 
+  filter(VISIT %in% c("PRN", "D1")) %>%
+  mutate(logRES = log(LABRESN),
+         VISIT=factor(VISIT, levels=c("PRN", "D1"), ordered = TRUE)) %>%
+  select(PATNUM, VISIT, LABRESN, logRES, -ACCSNM) %>% 
+  arrange(PATNUM, VISIT) %>% 
+  rename(c("RES"="LABRESN"))
+
+d  %>% 
+  kable(
+    col.names = c("Patient", "Visit", "IL1B (pg/mL)", "log IL1B"),
+    title = "Placebo run-in and baseline data only",
+    digits = 1
+  )
+
+# Histogram
+hist1 <- d %>% ggplot() + geom_histogram(aes(x=RES), bins = 6, fill="green", alpha=0.5) + xlab("IL1beta")
+hist2 <- d %>% ggplot() + geom_histogram(aes(x=logRES), bins = 6, fill="red", alpha=0.5) + xlab("Log IL1beta")
+
+
+# Boxplot
+boxplot <- d %>% ggplot(aes(x=VISIT, y=RES, color=VISIT)) +
+  geom_boxplot() + 
+  #stat_compare(   ) + 
+  stat_compare(aes(label = after_stat(sprintf("%s: %s", method, label))),
+               bracket = FALSE,
+               ymin = 140, 
+               ymax = 160,
+               ) +
+  theme_bw()
+
+# Spaghetti plot
+spaghetti <- d %>% ggplot(aes(x=VISIT, y=RES, label=PATNUM)) + 
+  geom_point(aes(group=PATNUM)) + 
+  geom_line(aes(group=PATNUM)) +
+  geom_text(aes(label=PATNUM), color = "red", size = 3) 
+
+(hist1 | hist2) 
+
+(boxplot / spaghetti)
+```
+
+## CRP data
+
+```{r }
+#| echo: FALSE
+#| warning: false
+
+# il1b merge with bme to get visit information
+dCRP <- crp %>% select(PATNUM, ACCSNM, LABRESN) %>% 
+  left_join(bme, join_by(PATNUM, ACCSNM)) %>% 
+  filter(VISIT %in% c("SCRN", "PRN", "D1", "D8", "D15", "D22", "D29", "D43FU")) %>%
+  mutate(logRES = log(LABRESN),
+         VISIT=factor(VISIT, 
+                      levels=c("SCRN", "PRN", "D1", "D8", "D15", "D22", "D29", "D43FU"), 
+                      ordered = TRUE)) %>%
+  select(PATNUM, VISIT, LABRESN, logRES, -ACCSNM) %>% 
+  arrange(PATNUM, VISIT) %>% 
+  rename(c("RES"="LABRESN")) %>% 
+  group_by(PATNUM) %>% 
+  #mutate(nRecord=n()) %>% 
+  filter(n()>=3) %>% # patients with at least SCRN, PRN and D1 measurement (ie, randomized)
+  filter(VISIT != "SCRN") %>% 
+  ungroup()
+
+dCRP %>% select(-logRES) %>% 
+  pivot_wider(
+    names_from = VISIT,
+    values_from = RES,
+    names_sort = TRUE
+  ) %>% 
+  kable(
+    #col.names = c("Patient", "Visit", "CRP (mg/L)"),
+    title = "CRP raw data",
+    digits = 1
+  )
+
+# Histogram
+hist1CRP <- dCRP %>% ggplot() + geom_histogram(aes(x=RES), bins = 6, fill="green", alpha=0.5) + xlab("CRP")
+hist2CRP <- dCRP %>% ggplot() + geom_histogram(aes(x=logRES), bins = 6, fill="red", alpha=0.5) + xlab("Log CRP")
+
+# Boxplot
+boxplotCRP <- dCRP %>% ggplot(aes(x=VISIT, y=RES, color=VISIT)) +
+  geom_boxplot()+
+  stat_compare(
+               #bracket = FALSE,
+               #ymin = 140, 
+               #ymax = 160,
+               ref_group = "D1"
+               ) +
+  theme_bw()
+
+(hist1CRP | hist2CRP)
+boxplotCRP
+
+# Spaghetti plot
+
+spaghettiCRP1 <- dCRP %>% ggplot(aes(x=VISIT, y=RES, label=PATNUM)) + 
+  geom_point(aes(group=PATNUM)) + 
+  geom_line(aes(group=PATNUM)) +
+  geom_text(aes(label=PATNUM), color = "red", size = 3) 
+
+spaghettiCRP2 <- dCRP %>% filter(PATNUM !="10029") %>% 
+  ggplot(aes(x=VISIT, y=RES, label=PATNUM)) + 
+  geom_point(aes(group=PATNUM)) + 
+  geom_line(aes(group=PATNUM))
+  #geom_text(aes(label=PATNUM), color = "red", size = 3) 
+
+(spaghettiCRP1 / spaghettiCRP2) 
+  
+```
+
+# Descriptive statistics
+
+The SD of log CRP on Run-in is 0.79 (it was 0.9 based on 12 patients' data in previous analysis);
+
+The SD of log CRP on Day 1 is 0.97 (the "outlier" had significant impact on the variability).
+
+```{r}
+#| echo: FALSE
+
+# mean and std
+dCRP %>% group_by(VISIT) %>% 
+  summarise(
+    across(
+      .cols = c(RES, logRES),
+      .fns = list(
+        N = \(x) sum(!is.na(x)), 
+        #Missing = \(x) sum(is.na(x)),
+        Mean = \(x) mean(x, na.rm = TRUE),
+        SD = \(x) sd(x, na.rm = TRUE)
+      )
+    )
+  )  %>% 
+  kable(digits = 2)
+
+```
+
+# Correlation analysis
+
+## CRP between visits
+
+The correlation coefficient is 0.67 (last time was 0.36 based on 12 patients' data on screening and run-in)
+
+```{r}
+#| echo: false
+
+# transform dataset from long to wide format
+d1CRP <- dCRP %>% 
+  #group_by(PATNUM, VISIT) %>% 
+  #summarise(logRES = mean(logRES, na.rm = TRUE), .groups = "drop") %>% 
+  pivot_wider(
+    names_from = VISIT,
+    values_from = c(RES, logRES)
+  ) %>% 
+  mutate(DIFF = RES_D1 - RES_PRN,
+         PCT_DIFF = DIFF/RES_D1*100) 
+
+# based on complete cases N=21
+d1CRP %>% 
+  select(starts_with("logRES")) %>% na.omit() %>% 
+  cor() %>% corrplot(method = "number", 
+                     title = "log-CRP: based on pts with available data on all visits (N=21)", 
+                     mar = c(1, 1, 1, 1))
+
+# based on pts with available data on PRN and D1
+d1CRP %>% filter(!is.na(DIFF)) %>% 
+  ggplot(aes(x = logRES_D1, y = logRES_PRN, label=PATNUM)) +
+  geom_point() +
+  geom_text(aes(label=PATNUM), color = "red", size = 2) +
+  stat_cor(p.accuracy = 0.001, r.accuracy = 0.01) +
+  labs(x = "Day1", y = "PRN", title = "log-CRP: based on pts with available data on PRN and D1, N=30") + 
+  theme_classic()
+
+# output corr for subsequent usage
+corr <- round(cor(d1CRP$logRES_PRN, d1CRP$logRES_D1, use = "pairwise.complete.obs"),2)
+```
+
+## CRP and IL1B on Day 1
+
+```{r}
+#| echo: false
+
+d %>% filter(VISIT=="D1") %>% 
+  select(-RES) %>% 
+  rename(logRES_IL1B=logRES) %>% 
+  left_join(d1CRP %>% select(PATNUM, logRES_D1), join_by(PATNUM)) %>% 
+  #select(logRES_IL1B, logRES_D1) %>% 
+  ggplot(aes(x = logRES_IL1B, y = logRES_D1, label=PATNUM)) +
+  geom_point() +
+  geom_text(aes(label=PATNUM), color = "red", size = 2) +
+  stat_cor(p.accuracy = 0.001, r.accuracy = 0.01) +
+  labs(x = "logIL1B", y = "logCRP", title = "CRP and IL1B on Day 1") + 
+  theme_classic()
+```
+
+# Agreement analysis
+
+## Bland-Altman analysis
+
+> IL1beta data is not normally distributed, the results should be intepreted with cautions.
+
+Plot of differences between two measurements. Shaded areas present confidence interval limits for mean and agreement limits.
+
+```{r}
+#| label: Bland-Altman
+#| echo: false
+#| warning: false
+
+# run the below one line code to generate plot  
+# with(d2, blandr.draw(RES_PRN, RES_D1, annotate = TRUE))
+
+d2CRP <- d1CRP %>% filter(!is.na(DIFF))
+
+statistics.results <- with(d2CRP, blandr.statistics(RES_PRN , RES_D1))
+blandr.plot.ggplot( statistics.results,
+                    plotTitle = "Bland-Altman plot for comparison of 2 measurements",) +
+  geom_text(aes(label=round(statistics.results$bias,1)), x=30, y=0, color="white")
+```
+
+Plot of differences between two measurements, expressed as percentages of the values on the axis \[(PRN – D1)/((PRN + D1)/2)%)\], vs. the mean of the two measurements.
+
+```{r}
+#| label: Bland-Altman - plot difference as percentage
+#| echo: false
+#| warning: false
+#| eval: true
+
+d2CRP <- d2CRP %>%  
+  mutate(RES_PRN_REL=2*RES_PRN/(RES_PRN+RES_D1)*100,
+         RES_D1_REL= 2*RES_D1 /(RES_PRN+RES_D1)*100
+  )
+# Passes data to the blandr.statistics function to generate Bland-Altman statistics
+statistics.results.rel <- with(d2CRP, blandr.statistics( RES_PRN_REL , RES_D1_REL ))
+
+# replace the relative means with raw means for plot
+statistics.results.rel$means <-  statistics.results$means
+
+# Generates a ggplot, with no optional arguments
+blandr.plot.ggplot( statistics.results.rel,
+                    plotTitle = "Bland-Altman plot for comparison of 2 measurements",) + 
+  labs(y= "Difference/Average(%)") +
+  geom_text(aes(label=round(statistics.results.rel$bias,1)), x=30, y=0, color="white")
+```
+
+# Simulation
+
+> Four scenarios are considered in the following simulation, assume a logNormal distribution with a mean of 1.0 and standard deviation: 0.96 (from Day 1) and D1 to Day 29 correlation coeffient of `r sprintf("%1.2f", corr)`
+>
+> -   All patients benefit
+>
+>     1.  placebo effect 10% + simulation approach assuming response drawn from beta distribution
+>
+>     2.  placebo effect 10% + simulation approach without assuming response drawn from beta distribution (to compare different data generation approaches)
+>
+>     3.  placebo effect 0% (to evaluate the impact of placebo effect)
+>
+> -   Partial patients benefit + placebo effect 0%
+
+## All benefit, placebo effect 10% (original simulation approach)
+
+### Generate random data for a single trial
+
+Assume a logNormal distribution with a mean of 1, a standard deviation of 0.96 and a correlation of `r sprintf("%1.2f", corr)` between baseline and endpoint.
+
+The example below assumes a mean change between baseline and endpoint of 70% and 10% on Control. The percentage *reductions* have Beta distributions with parameters (α~T~ = 7, β~T~ = 3) and (α~C~ = 1, β~C~ = 9) respectively.
+
+```{r}
+#| label: generate-data
+#| echo: FALSE
+dOne <- generateBiomarkerData1(
+  mu = c("logRES" = 1),
+  sigma2 = 0.96 * 0.96,
+  rho = corr,
+  deltaTest = 70,
+  deltaControl = 10,
+  effect_limit = 0
+)
+
+dOneWide <- dOne %>% 
+  pivot_wider(
+    values_from = Value,
+    names_from = TimePoint
+  ) 
+
+dOneWide %>% 
+  kable(
+    caption = "Simulated data for 20 participants", 
+    digits = 2,
+    col.names = c("PID", "Treat", "Baseline", "Endpoint", "Change")
+  )
+```
+
+### Controlling the variation of response
+
+By drawing the treatment effect for each participant from a random distribution, we add realism to the simulation. We also give ourselves additional control of the simulation: by reducing the variation in response - in the extreme, to zero - we move towards a fixed effect. By increasing the variation, we potentially reduce the average treatment effect by modelling heterogeneity in the overall population.
+
+The mean of a Beta(a, b) distribution is equal to a / (a + b). The equation for the variance is more complicated, but *decreases* as the values of a and b *increase*. So the distributions Beta(3.5, 1.5), Beta(7, 3) and Beta(14, 6) all have a mean of 0.7 but decreasing variance. The figure below illustrates the shapes of these three distributions.
+
+```{r}
+#| label: beta-distributions
+#| echo: FALSE
+
+tibble(
+  alpha = rep(c(3.5, 7, 14), each = 101),
+  beta = rep(c(1.5, 3, 6), each = 101),
+  x = rep(seq(0, 1, 0.01), times = 3),
+  y = dbeta(x, alpha, beta)
+) %>% 
+ggplot(aes(x = x, y = y, colour = interaction(alpha, beta))) +
+geom_line() +
+geom_vline(aes(xintercept = 0.7), colour = "lightgrey") +
+scale_colour_discrete(
+  name = " ", 
+  labels = c("Beta(3.5, 1.5)", "Beta(7, 3)", "Beta(14, 6)", "Beta(0.1, 9.9)")
+) +
+labs(x = "P(Response)") +
+theme_light() +
+theme(
+  axis.ticks.y = element_blank(),
+  axis.text.y = element_blank(),
+  axis.title.y = element_blank()
+)
+```
+
+The 50% and 90% ci's for these three distributions are given in the table below:
+
+```{r}
+#| label: beta-cis
+#| echo: FALSE
+
+tibble(
+  alpha = c(3.5, 7, 14),
+  beta = c(1.5, 3, 6),
+  q1 = qbeta(0.25, alpha, beta),
+  q2 = qbeta(0.75, alpha, beta),
+  q3 = qbeta(0.05, alpha, beta),
+  q4 = qbeta(0.95, alpha, beta)
+) %>% 
+kable(
+  digits = c(1, 1, 3, 3, 3, 3),
+  col.names = c("Alpha", "Beta", "Lower", "Upper", "Lower", "Upper")
+) %>% 
+add_header_above(c(" " = 2, "50% CI" = 2, "90% CI" = 2))
+```
+
+So, for example, if we use a Beta(7, 3) distribution to generate treatment effects for selnoflast, half of the participant-level reductions of endpoint values will lie between (approximately) 60% and 80% whereas nine out of ten will lie between 45% and 90%.
+
+### Summarise a single trial
+
+For illustration, assume that "Go" decision requires the the relative reduction on Test to exceed that on Control by at least 30%.
+
+```{r}
+#| label: analyse-single
+#| echo: false
+
+dOneWide %>% 
+  add_column(Trial = 1) %>% 
+  analyseTrial(threshold = 30) %>% 
+  mutate(Effect = PctMeanDelta_Test - PctMeanDelta_Control) %>% 
+  select(PctMeanDelta_Test, PctMeanDelta_Control, Effect, Outcome) %>% 
+  kable(digits = 1)
+```
+
+### Operating characteristics
+
+As before, assume a logNormal distribution with a mean of 1.0, a standard deviation of 0.96 and a correlation of `r sprintf("%1.2f", corr)` between baseline and endpoint.
+
+Fix the mean reduction of the endpoint value on Control at 10% \[distributed as Beta(1, 9)\].
+
+Vary the true mean reduction on Test between 5% and 95% in steps of 5% \[distributed as Beta(x/10, (10-x)/10)\].
+
+Declare the trial to be a success (ie results in a Go decision) when
+
+1.  The endpoint mean - baseline mean in the Test group is negative (ie there is a reduction in IL1-β between baseline and endpoint on Test; and
+
+2.  The percentage reduction in the Test group exceeds that in the Control group by at least δ% \[δ= 30% to 70% in increments of 10%\]
+
+> As an example, the baseline mean in both Test and Control groups is 250. The corresponding endpoint means are 100 and 225. The absolute mean changes are 150 on Test and 25 on Control. The percentage changes are 60% and 10%, a difference of 50%. The trial is a success for all values of δ less than 50% and a failure for all values of 50% and above.
+
+Run examples of this trial for each combination of x and δ for total trial sizes of 30, 60 and 90.
+
+> This process takes about 60 minutes to simulate 2000 trials for each of 3 x 4 x 20 = 240 scenarios. Parallelisation is used when possible.
+
+```{r}
+#| label: operating characteristics
+#| echo: FALSE
+#| eval: true
+
+nSim <- 2000
+dSim1 <- getOperatingCharacteristics3(
+  nSim = nSim,
+  nPerGroup = c(30, 60, 90) / 2,
+  deltaTest = seq(0, 95, 5),
+  threshold = seq(20, 50, 10),
+  generateData = generateBiomarkerData1,
+  dataFile = here("IL1beta", "Sim_CRP_std0.96_plb10_goc3.Rds"),
+# the following parameters are passed to generateBiomarkerData1()    
+  mu = c("logRES" = 1),
+  sigma2 = 0.96 * 0.96,
+  rho = corr,
+  deltaControl = 10, # placebo effect
+  effect_limit = 0
+)
+```
+
+### OC summary
+
+```{r}
+#| echo: FALSE
+
+p1 <- dSim1 %>% 
+  mutate(NTotal = as.factor(2 * NPerGroup)) %>% 
+  ggplot() +
+    geom_line(aes(x = Delta, y = GoProb, colour = NTotal)) +
+    facet_wrap(vars(Threshold), labeller = as_labeller(function(z) paste0(z,"%"), label_both)) +
+    labs(
+      x = "True response rate for selnoflast",
+      colour = "Trial size",
+      y = "Prob(Go)",
+      title = paste0("Based on ", nSim, " simulations per scenario.  Pbo response rate: 10%")
+    ) 
+ggplotly(p1) %>% layout(hovermode="x")
+
+dSim1 %>% createOCSummaryTable()
+
+```
+
+### OC summary: Go/NoGo/Consider
+
+```{r}
+#| echo: FALSE
+
+dSim1 %>% createOCSummaryFigure_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 10, 
+                                     nSim = nSim)
+dSim1 %>% createOCSummaryTable_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 10, 
+                                     nSim = nSim)
+
+```
+
+## All benefit, placebo effect 10% (new simulation approach)
+
+Data are generated using a new function "generateBiomarkerData2", without assuming the selnoflast/placebo "response" rate are from beta distributions. The log-transformed baseline and endpoint (post-treatment) data in each arm are sampled from a multivariate normal distribution assuming the standard deviation (SD) of log-transformed baseline and endpoint in both arms are the same, estimated from the observed data on Day 1. The correlation between baseline and endpoint are used in the generating the random samples.
+
+Given the SDs of endpoint in both arm in particular in test arm are unknown, we make a reasonable assumption that the treatment does not alter the variability of the endpoint measure ([Reference](https://handbook-5-1.cochrane.org/chapter_16/16_1_3_2_imputing_standard_deviations_for_changes_from_baseline.htm#:~:text=Note%20that%20the%20mean%20change,it%20is%20not%20presented%20explicitly. "Reference")). As long as we have a estimate of endpoint SD, it can be used in the simulation.
+
+The treatment effect in each arm measured by percentage of mean change from baseline (𝛥) in raw data scale. After log-transformation, the effect measure can be expressed in mean difference as following:
+
+$$
+𝛿 = 𝜇_2 - 𝜇_1 = \frac{1}{2}* (𝜎_1^2 - 𝜎_2^2) + log(1-𝛥)
+$$
+
+where $u_1, u_2$ and $𝜎_1, 𝜎_2$ are the mean and SD of log-transformed baseline and endpoint, respectively.
+
+Refer to <https://www.statlect.com/probability-distributions/log-normal-distribution> for more details.
+
+The advantage of this data generation approach is that we can specify the SD of baseline and endpoint explicitly and no need to further assume a "response" rate from beta distributions.
+
+In the following simulation, we assume a log-normal distribution with a mean of 1.0 (baseline), a SD of 0.96 (baseline and endpoint) and a correlation of `r sprintf("%1.2f", corr)` between baseline and endpoint.
+
+```{r}
+#| echo: FALSE
+#| error: TRUE
+nSim <- 2000
+dSim2 <- getOperatingCharacteristics4( 
+    nSim = nSim,
+    nPerGroup = c(30, 60, 90) / 2,    
+    deltaTest = seq(0, 95, 5),        
+    deltaControl = 10,          # placebo effect
+    threshold = seq(20, 50, 10),  
+    generateData = generateBiomarkerData2,
+    dataFile = here("IL1beta", "Sim_CRP_std0.96_plb10_goc4.Rds"),
+    
+    # the following parameters are passed to generateBiomarkerData2()   
+    rho = corr,
+    sigma = list(
+      "Baseline" = 0.96, 
+      "Control" = 0.96,
+      "Test" = 0.96
+    ),
+    mu = c("Baseline" = 1),
+    effect_limit = 0,  # effect limit
+)
+```
+
+### OC summary
+
+```{r}
+#| echo: FALSE
+#| error: TRUE
+p2 <- dSim2 %>% 
+  mutate(NTotal = as.factor(2 * NPerGroup)) %>% 
+  ggplot() +
+  geom_line(aes(x = Delta, y = GoProb, colour = NTotal)) +
+  facet_wrap(vars(Threshold), labeller = as_labeller(function(z) paste0(z,"%"), label_both)) +
+  labs(
+    x = "True response rate for selnoflast",
+    colour = "Trial size",
+    y = "Prob(Go)",
+    title = paste0("Based on ", nSim, " simulations per scenario.  Pbo response rate: 10%")
+    ) 
+ggplotly(p2)
+
+dSim2 %>% createOCSummaryTable()
+
+```
+
+### OC summary: Go/NoGo/Consider
+
+```{r}
+#| echo: FALSE
+
+dSim2 %>% createOCSummaryFigure_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 10, 
+                                     nSim = nSim)
+dSim2 %>% createOCSummaryTable_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 10, 
+                                     nSim = nSim)
+
+```
+
+By comparing this and the above "All benefit, standard deviation 0.96, placebo effect 10%", the results are largely consistent.
+
+## All benefit, placebo effect 0% (original simulation approach)
+
+```{r}
+#| echo: FALSE
+#| error: TRUE
+nSim <- 2000
+dSim3 <- getOperatingCharacteristics3(
+  nSim = nSim,
+  nPerGroup = c(30, 60, 90) / 2,
+  deltaTest = seq(0, 95, 5),
+  threshold = seq(20, 50, 10),
+  generateData = generateBiomarkerData1,
+  dataFile = here("IL1beta", "Sim_CRP_std0.96_plb0_goc3.Rds"),
+  
+# the following parameters are passed to generateBiomarkerData1()    
+  mu = c("logRES" = 1),
+  sigma2 = 0.96 * 0.96,
+  rho = corr,
+  deltaControl = 0, # placebo effect
+  effect_limit = 0
+)
+```
+
+### OC summary
+
+```{r}
+#| echo: FALSE
+#| error: TRUE
+p3 <- dSim3 %>% 
+  mutate(NTotal = as.factor(2 * NPerGroup)) %>% 
+  ggplot() +
+    geom_line(aes(x = Delta, y = GoProb, colour = NTotal)) +
+    facet_wrap(vars(Threshold), labeller = as_labeller(function(z) paste0(z,"%"), label_both)) +
+    labs(
+      x = "True response rate for selnoflast",
+      colour = "Trial size",
+      y = "Prob(Go)",
+      title = paste0("Based on ", nSim, " simulations per scenario.  Pbo response rate: 10%")
+    ) 
+ggplotly(p3)
+
+dSim3 %>% createOCSummaryTable()
+
+```
+
+### OC summary: Go/NoGo/Consider
+
+```{r}
+#| echo: FALSE
+
+dSim3 %>% createOCSummaryFigure_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 0, 
+                                     nSim = nSim)
+dSim3 %>% createOCSummaryTable_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 0, 
+                                     nSim = nSim)
+
+```
+
+## All benefit, placebo effect 0% (new simulation approach)
+
+```{r}
+#| echo: FALSE
+#| error: TRUE
+nSim <- 2000
+dSim4 <- getOperatingCharacteristics4( 
+    nSim = nSim,
+    nPerGroup = c(30, 60, 90) / 2,    
+    deltaTest = seq(0, 95, 5),        
+    deltaControl = 0,          # placebo effect
+    threshold = seq(20, 50, 10),  
+    generateData = generateBiomarkerData2,
+    dataFile = here("IL1beta", "Sim_CRP_std0.96_plb0_goc4.Rds"),
+    
+    # the following parameters are passed to generateBiomarkerData2()   
+    rho = corr,
+    sigma = list(
+      "Baseline" = 0.96, 
+      "Control" = 0.96,
+      "Test" = 0.96
+    ),
+    mu = c("Baseline" = 1),
+    effect_limit = 0,  # effect limit
+)
+```
+
+### OC summary
+
+```{r}
+#| echo: FALSE
+#| error: TRUE
+p4 <- dSim4 %>% 
+  mutate(NTotal = as.factor(2 * NPerGroup)) %>% 
+  ggplot() +
+  geom_line(aes(x = Delta, y = GoProb, colour = NTotal)) +
+  facet_wrap(vars(Threshold), labeller = as_labeller(function(z) paste0(z,"%"), label_both)) +
+  labs(
+    x = "True response rate for selnoflast",
+    colour = "Trial size",
+    y = "Prob(Go)",
+    title = paste0("Based on ", nSim, " simulations per scenario.  Pbo response rate: 10%")
+    ) 
+ggplotly(p4)
+
+dSim4 %>% createOCSummaryTable()
+
+```
+
+### OC summary: Go/NoGo/Consider
+
+```{r}
+#| echo: FALSE
+
+dSim4 %>% createOCSummaryFigure_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 0, 
+                                     nSim = nSim)
+dSim4 %>% createOCSummaryTable_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 0, 
+                                     nSim = nSim)
+
+```
+
+
+## Partial benefit, placebo effect 0% (original simulation approach)
+
+> Assumption: The effect of active treatment depends whether or not the simulated “untreated” endpoint value is above a threshold. If the simulated “untreated” endpoint is above the threshold, the active treatment has its full effect. Otherwise it has an effect equal to the control treatment. The effect of the control treatment does not depend on the size of the endpoint value in relation to the threshold.
+
+25% percentile calculated using the pooled RUN-IN and Day1 data.
+
+```{r}
+#| label: calculate Q1 of baseline based on pooled data
+#| echo: false
+
+dCRP %>% 
+  summarise(
+    across(
+      .cols = c(RES),
+      .fns = list(
+        N = \(x) sum(!is.na(x)), 
+        Mean = \(x) mean(x, na.rm = TRUE),
+        Q1 = \(x) quantile(x, 0.25, na.rm = TRUE),
+        Q3 = \(x) quantile(x, 0.75, na.rm = TRUE)
+      )
+    ),
+    .groups = "keep"
+  )  %>% 
+  kable(digits = 2)
+
+# create a variable limit for subsequent use
+limit <- quantile(dCRP$RES, 0.25, na.rm = TRUE)
+```
+
+```{r}
+#| echo: FALSE
+#| error: TRUE
+nSim <- 2000
+dSim5 <- getOperatingCharacteristics3(
+  nSim = nSim,
+  nPerGroup = c(30, 60, 90) / 2,
+  deltaTest = seq(0, 95, 5),
+  threshold = seq(20, 50, 10),
+  generateData = generateBiomarkerData1,
+  dataFile = here("IL1beta", "Sim_CRP_std0.96_plb0_goc3_partial.Rds"),
+# the following parameters are passed to generateBiomarkerData1()    
+  mu = c("logRES" = 1),
+  sigma2 = 0.96 * 0.96,
+  rho = corr,
+  deltaControl = 0, # placebo effect
+  effect_limit = limit # effect limit
+)
+```
+
+### OC summary
+
+```{r}
+#| echo: FALSE
+#| error: TRUE
+p5 <- dSim5 %>% 
+  mutate(NTotal = as.factor(2 * NPerGroup)) %>% 
+  ggplot() +
+    geom_line(aes(x = Delta, y = GoProb, colour = NTotal)) +
+    facet_wrap(vars(Threshold), labeller = as_labeller(function(z) paste0(z,"%"), label_both)) +
+    labs(
+      x = "True response rate for selnoflast",
+      colour = "Trial size",
+      y = "Prob(Go)",
+      title = paste0("Based on ", nSim, " simulations per scenario.  Pbo response rate: 10%")
+    ) 
+ggplotly(p5)
+
+dSim5 %>% createOCSummaryTable()
+
+```
+
+### OC summary: Go/NoGo/Consider
+
+```{r}
+#| echo: FALSE
+
+dSim5 %>% createOCSummaryFigure_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 0, 
+                                     nSim = nSim)
+dSim5 %>% createOCSummaryTable_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 0, 
+                                     nSim = nSim)
+
+```
+
+## Partial benefit, placebo effect 0% (new simulation approach)
+
+```{r}
+#| echo: FALSE
+#| error: TRUE
+nSim <- 2000
+dSim6 <- getOperatingCharacteristics4( 
+    nSim = nSim,
+    nPerGroup = c(30, 60, 90) / 2,    
+    deltaTest = seq(0, 95, 5),        
+    deltaControl = 0,          # placebo effect
+    threshold = seq(20, 50, 10),  
+    generateData = generateBiomarkerData2,
+    dataFile = here("IL1beta", "Sim_CRP_std0.96_plb0_goc4_partial.Rds"),
+    
+    # the following parameters are passed to generateBiomarkerData2()   
+    rho = corr,
+    sigma = list(
+      "Baseline" = 0.96, 
+      "Control" = 0.96,
+      "Test" = 0.96
+    ),
+    mu = c("Baseline" = 1),
+    effect_limit = limit,  # effect limit
+)
+```
+
+### OC summary
+
+```{r}
+#| echo: FALSE
+#| error: TRUE
+p6 <- dSim6 %>% 
+  mutate(NTotal = as.factor(2 * NPerGroup)) %>% 
+  ggplot() +
+  geom_line(aes(x = Delta, y = GoProb, colour = NTotal)) +
+  facet_wrap(vars(Threshold), labeller = as_labeller(function(z) paste0(z,"%"), label_both)) +
+  labs(
+    x = "True response rate for selnoflast",
+    colour = "Trial size",
+    y = "Prob(Go)",
+    title = paste0("Based on ", nSim, " simulations per scenario.  Pbo response rate: 10%")
+    ) 
+ggplotly(p6)
+
+dSim6 %>% createOCSummaryTable()
+
+```
+
+### OC summary: Go/NoGo/Consider
+
+```{r}
+#| echo: FALSE
+
+dSim6 %>% createOCSummaryFigure_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 0, 
+                                     nSim = nSim)
+dSim6 %>% createOCSummaryTable_3ODM(GoThreshold =30,
+                                     NoGoThreshold = 20,
+                                     DeltaControl = 0, 
+                                     nSim = nSim)
+
+```
+

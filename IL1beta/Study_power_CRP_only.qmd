@@ -1,0 +1,311 @@
+---
+title: "Exploration of BP44551 CRP data"
+format: html
+editor: visual
+reference-location: margin
+embed-resources: TRUE
+params:
+  dataFile: "Study_CRP.Rds"
+---
+
+```{r}
+#| label: set-up
+#| echo: FALSE
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(knitr)
+  library(kableExtra)
+  library(mvtnorm)
+  library(here)
+  library(parallel)
+  library(hms)
+})
+
+source("functions.R", echo = FALSE)
+```
+
+## Raw data from BP44551
+
+```{r}
+#| label: raw-data
+#| echo: FALSE
+
+d <- readxl::read_xlsx(
+  file.path(
+    here("IL1beta"), 
+    "BP44551_Q2S_lab_review_CRP values_03Jun2024_JKEdit.xlsx"
+  )
+) %>% 
+rename(
+  SubjectID = `Subject Identifier for the Study`, 
+  PatientID = `Patient ID`, 
+  VisitDate = `Visit Date`,        
+  VisitTime = `Visit Time`,        
+  VisitName = `Visit Names`,
+  CRP = `Numeric Result_Finding in Standard Units`,
+  Units = `Standard Units` 
+) %>% 
+filter(
+  VisitName %in% c("SCREENING", "RUN-IN"),
+  !is.na(CRP)
+) %>% 
+arrange(SubjectID, VisitName, VisitDate, VisitTime) %>% 
+group_by(SubjectID, VisitName, VisitDate, VisitTime) %>% 
+mutate(Row = row_number()) %>% 
+filter(Row == max(Row)) %>% 
+mutate(
+  logCRP = log(CRP), 
+  VisitTime = as_hms(VisitTime)
+) %>% 
+select(-Row, -PatientID)
+
+d %>% kable(digits=3)
+```
+
+## Summary of BP44551 CRP data
+
+If participant has multiple SCREENING values, use the last one, ignoring others. Filter to include only those participants who have both RUN-IN and SCREENING data.
+
+```{r}
+#| label: summary
+#| echo: FALSE
+
+d1 <- d %>% 
+  group_by(SubjectID) %>% 
+  pivot_wider(
+    names_from = VisitName,
+    values_from = c(CRP, logCRP)
+  ) %>% 
+  group_by(SubjectID,	Units) %>% 
+  summarise(
+    across(matches("CRP"), \(x) ifelse(n() - sum(is.na(x)) > 0, max(x, na.rm = TRUE), NA)),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    RawChange = CRP_SCREENING - `CRP_RUN-IN`,
+    LogChange = logCRP_SCREENING - `logCRP_RUN-IN`,
+  ) %>% 
+  select(SubjectID, CRP_SCREENING, `CRP_RUN-IN`, RawChange, logCRP_SCREENING, `logCRP_RUN-IN`, LogChange) %>% 
+  filter(!is.na(RawChange))
+
+d1 %>% 
+  kable(
+    col.names = c("Subject", rep(c("Screening", "Run-in", "Change"), 2)),
+    digits = c(0, 2, 2, 2, 3, 3, 3)
+  ) %>% 
+  add_header_above(c(" " = 1, "Raw scale" = 3, "Log scale" = 3))
+```
+
+```{r}
+#| label: summary-1
+#| echo: FALSE
+
+d1Mean <- d1 %>% 
+  summarise(
+    across(-SubjectID, mean)
+  ) 
+d1Mean %>% 
+  kable(
+    col.names = c(rep(c("Screening", "Run-in", "Change"), 2)),
+    caption = "Mean raw and log CRP (mg/dL)",
+    digits = 3
+  ) %>% 
+  add_header_above(c("Raw scale" = 3, "Log scale" = 3))
+
+d1SD <- d1 %>% 
+  summarise(
+    across(-SubjectID, sd)
+  ) 
+d1SD %>% 
+ kable(
+    col.names = c(rep(c("Screening", "Run-in", "Change"), 2)),
+    caption = "SD raw and log CRP (mg/dL)",
+    digits = 3
+  ) %>% 
+  add_header_above(c("Raw scale" = 3, "Log scale" = 3))
+
+d1 %>% 
+  ggplot() +
+    geom_point(aes(x = logCRP_SCREENING, y = `logCRP_RUN-IN`))
+d1 %>% 
+  ggplot() +
+    geom_point(aes(x = CRP_SCREENING, y = `CRP_RUN-IN`))
+
+corr <- cor(d1$logCRP_SCREENING, d1["logCRP_RUN-IN"])
+```
+
+The correlations between SCREENING and RUN-IN for log CRP is `r sprintf("%1.3f", corr)`.
+
+## Power calculations
+
+### Variance
+
+[Cochran's Theorem](https://en.wikipedia.org/wiki/Cochran%27s_theorem#Sample_mean_and_sample_variance) states that the distribution of the sample variance is given by
+
+$$ \frac{(n-1)s^2}{\sigma^2} \sim \chi^2_{n-1}  $$
+
+or
+
+$$  \sigma^2 \sim \frac{(n-1)s^2} {\chi^2_{n-1}}  $$
+
+So that the 95% confidence intervals for the standard deviation of CRP change as seen in the trial so far are
+
+```{r}
+#| label: params-1
+#| echo: FALSE
+
+var <- tibble(
+  Variable = c("CRP", "logCRP"),
+  ObservedSD = c(d1SD %>% pull(RawChange), d1SD %>% pull(LogChange)),
+  N = d1 %>% nrow(),
+  LowerChiSq = qchisq(0.025, N - 1),
+  UpperChiSq = qchisq(0.975, N - 1),
+  LowerVar = 1/UpperChiSq * c(d1SD %>% pull(RawChange), d1SD %>% pull(LogChange))^2 * (N-1),
+  UpperVar = 1/LowerChiSq * c(d1SD %>% pull(RawChange), d1SD %>% pull(LogChange))^2 * (N-1),
+  LowerSD = sqrt(LowerVar),
+  UpperSD = sqrt(UpperVar)
+)
+
+var %>% select(Variable, ends_with("SD")) %>% kable(digits = 3)
+```
+
+### Mean
+
+There should be no difference between SCREENING and RUN-IN CRP values, since no treatment is administered in this period. Therefore, pool these values to get an overall mean and calculate the variation associated with it.
+
+```{r}
+#| label: params-2
+#| echo: FALSE
+
+mean <- d1 %>% 
+  pivot_longer(
+    c(starts_with("CRP"), starts_with("logCRP")),
+    values_to = "Value",
+    names_to = "Variable"
+  ) %>% 
+  select(-ends_with("Change")) %>% 
+  rowwise() %>% 
+  mutate(Variable = strsplit(Variable, "_")) %>% 
+  unnest(Variable) %>% 
+  filter(Variable %in% c("CRP", "logCRP")) %>% 
+  group_by(Variable) %>% 
+  summarise(
+    ObservedMean = mean(Value),
+    SD = sd(Value)
+  ) %>% 
+  mutate(
+  N = d1 %>% nrow(),
+  LowerT = qt(0.025, N - 1),
+  UpperT = qt(0.975, N - 1),
+  LowerMean = ObservedMean + LowerT * SD / sqrt(N-1),
+  UpperMean = ObservedMean + UpperT * SD / sqrt(N-1),
+)
+
+mean %>%
+  select(Variable, ObservedMean, LowerMean, UpperMean) %>%
+  kable(digits = 3)
+```
+
+### Study power
+
+A simple power calculation is based on the mean (of pooled SCREENING and RUN-IN values) and standard deviation (of difference between SCREENING and RUN-IN) observed in the study to date. But, as shown above, these estimates themselves have variation associated with them. The lowest power of the trial consistent with this observed information occurs when the smallest mean change is associated with the largest standard deviation. Similarly, the trial's power is greatest when the largest mean change is associated with the smallest standard deviation. I calculate the power for these combinations as well as for the simple observed mean and standard deviation pairing.
+
+In each case, I assume that the placebo effect is to reduce the endpoint value by 10%.
+
+The other parameters that varies including:
+
+-   Selnoflast effect from 0 to 100% by 10%
+
+-   Trial size of 20, 40, 60, 90
+
+-   One-sided alpha of 0.025, 0.05, 0.1
+
+-   CRP on raw and log scale
+
+```{r}
+#| label: power
+#| echo: FALSE
+power <- tibble(
+  # Input parameters
+  Variable = rep(c("CRP", "log CRP"), each = 3),
+  Label = rep(c("Best case", "Observed", "Worst case"), times = 2),
+  Mean = c(
+    mean %>% filter(Variable == "CRP") %>% pull(UpperMean),
+    mean %>% filter(Variable == "CRP") %>% pull(ObservedMean),
+    mean %>% filter(Variable == "CRP") %>% pull(LowerMean),
+    mean %>% filter(Variable == "logCRP") %>% pull(UpperMean),
+    mean %>% filter(Variable == "logCRP") %>% pull(ObservedMean),
+    mean %>% filter(Variable == "logCRP") %>% pull(LowerMean)
+  ),
+  SD = c(
+    var %>% filter(Variable == "CRP") %>% pull(LowerSD),
+    var %>% filter(Variable == "CRP") %>% pull(ObservedSD),
+    var %>% filter(Variable == "CRP") %>% pull(UpperSD),
+    var %>% filter(Variable == "logCRP") %>% pull(LowerSD),
+    var %>% filter(Variable == "logCRP") %>% pull(ObservedSD),
+    var %>% filter(Variable == "logCRP") %>% pull(UpperSD)
+  ),
+  ControlEffect = -Mean * 0.1
+) %>% 
+# Selnoflast effect
+expand(
+  nesting(Variable, Label, Mean, SD, ControlEffect), 
+  ## As a percentage reduction
+  Selnoflast = seq(100, 0, -10),
+  NPerGroup = c(10, 20, 30, 45),
+  AlphaOneSided = c(0.025, 0.05, 0.1)
+) %>% 
+mutate(
+  TrialSize = 2 * NPerGroup,
+  ## As an absolute change
+  SelnoflastEffect = -Selnoflast * Mean / 100
+) %>% 
+mutate(
+  T = (SelnoflastEffect - ControlEffect) / sqrt(2 * SD * SD / NPerGroup),
+  Prob = pt(q=qt(AlphaOneSided, TrialSize-1), ncp=T, df=TrialSize - 1)
+
+# calculate the critical t-value for the given significance level and degrees of freedom
+#  t_crit = qt(AlphaOneSided, df=TrialSize-1),
+
+# calculate the non-centrality parameter
+#  ncp = (SelnoflastEffect - ControlEffect) / sqrt(2 * SD * SD / NPerGroup),
+
+# calculate the Type II error rate
+#  Prob = pt(t_crit, df, ncp, lower.tail=TRUE)
+)
+
+power %>% 
+  pivot_wider(
+    id_cols = c(Variable, TrialSize, AlphaOneSided,  Selnoflast),
+    names_from = Label,
+    values_from = Prob
+  ) -> power_out
+
+power_out %>% filter(Variable == "log CRP") %>% 
+  mutate(TrialSizeLabel = paste0("N=", TrialSize)) %>% 
+  ggplot() +
+    geom_line(aes(x = Selnoflast, y = Observed), color = "red") +
+    geom_ribbon(aes(x = Selnoflast, ymin = `Worst case`, ymax = `Best case`),
+                alpha = 0.5) +
+    facet_grid(vars(TrialSizeLabel), vars(AlphaOneSided),
+               labeller = labeller(AlphaOneSided=label_both)) +
+   ggtitle("CRP on log scale") +
+   theme(plot.title = element_text(hjust = 0.5)) +
+   ylab("Power") + xlab("Selnoflast effect %")
+
+power_out %>% filter(Variable == "CRP") %>% 
+  mutate(TrialSizeLabel = paste0("N=", TrialSize)) %>% 
+  ggplot() +
+    geom_line(aes(x = Selnoflast, y = Observed), color = "red") +
+    geom_ribbon(aes(x = Selnoflast, ymin = `Worst case`, ymax = `Best case`),
+                alpha = 0.5) +
+    facet_grid(vars(TrialSizeLabel), vars(AlphaOneSided),
+               labeller = labeller(AlphaOneSided=label_both)) +
+   ggtitle("CRP on raw scale") +
+   theme(plot.title = element_text(hjust = 0.5)) +
+   ylab("Power") + xlab("Selnoflast effect %")
+    
+```
+
+As shown in the graphs, for a given scenario, the power can vary over a large range from best case to worst case.

@@ -1,0 +1,101 @@
+---
+title: "Simulation to understand treatment effect (difference in percentage of mean change from baseline) varibility"
+format: html
+editor: visual
+embed-resources: TRUE
+params:
+  dataFile: "sim_std_treatment_effect.Rds"
+---
+
+```{r}
+#| label: set-up
+#| echo: FALSE
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(knitr)
+  library(kableExtra)
+  library(mvtnorm)
+  library(here)
+  library(parallel)
+  library(rice)
+  library(ggpubr)
+  library(blandr)
+  library(irr)
+  library(psych)
+  library(plyr) # rdply provides a stronger version of replicate function that replicate expression and return results in a data frame
+})
+
+source("functions.R", echo = FALSE)
+```
+
+```{r}
+#| echo: FALSE
+simple <- function(threshold=30,
+                   mu=4,
+                   sigma2=1*1){
+  
+dOne <- generateBiomarkerData(
+  mu = c("logRES" = mu),
+  sigma2 = sigma2,
+  rho = 0.7,
+  seed = floor(.Machine$integer.max * runif(1))
+)
+
+dOneWide <- dOne %>% 
+  pivot_wider(
+    values_from = Value,
+    names_from = TimePoint
+  ) 
+
+dOut <- dOneWide %>% analyseTrial(threshold = threshold)
+
+dOut
+}
+
+#simple()
+```
+
+Simulate trials (N=20) under different mu and sigma combinations by fixing correlation (rho) and mean response rate of 70% and 10% in Selnoflast arm and Placebo arm, respectively.
+
+```{r}
+#| echo: FALSE
+
+if (file.exists("sim_std_treatment_effect.Rds")) {
+  dAll <- readRDS("sim_std_treatment_effect.Rds")
+  message(paste0("Data read from ", "sim_std_treatment_effect.Rds", "."))
+  } else {
+  
+  # simulate datasets under different mu and sigma combinations
+dOut1 <- plyr::rdply(1000, simple()) %>% add_column(scenario="mu=4, sd=1")
+dOut2 <- plyr::rdply(1000, simple(mu=1.25, sigma2=0.8*0.8))%>% add_column(scenario="mu=1.25, sd=0.8")
+dOut3 <- plyr::rdply(1000, simple(mu=10, sigma2=1*1))%>% add_column(scenario="mu=10, sd=1")
+dOut4 <- plyr::rdply(1000, simple(mu=4, sigma2=2*2))%>% add_column(scenario="mu=4, sd=2")
+dOut5 <- plyr::rdply(1000, simple(mu=1.25, sigma2=1*1))%>% add_column(scenario="mu=1.25, sd=1")
+
+dAll <- bind_rows(dOut1, dOut2, dOut3, dOut4, dOut5) %>% mutate(Effect=DeltaPct_Control - DeltaPct_Test)
+
+saveRDS(dAll, "sim_std_treatment_effect.Rds")
+}
+
+```
+
+```{r}
+#| echo: FALSE
+#| warning: false
+# summarise the results by checking the mean and sd of treatment effect
+dAll  %>% 
+  group_by(scenario) %>% 
+  dplyr::summarise(  # should add dplyr before summarise to avoid error 
+    across(
+    .cols = c(Effect),
+    .fns = list(Mean = \(x) mean(x, na.rm = TRUE),
+                SD = \(x) sd(x, na.rm = TRUE) )
+          )
+         ) %>% 
+  knitr::kable(digits = 1)
+
+dAll %>% group_by(scenario) %>% 
+  ggplot(aes(x=Effect,  y=after_stat(density), color=scenario))  + geom_density(alpha=0.3) +
+  xlim(-200, 200)
+```

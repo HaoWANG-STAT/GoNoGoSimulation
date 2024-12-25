@@ -1,0 +1,27 @@
+{
+  "R": {
+    "Version": "4.3.3",
+    "Repositories": [
+      {
+        "Name": "NON_VALIDATED",
+        "URL": "https://packages.roche.com/Non-Validated/2024-04-16+umxWDUm-"
+      },
+      {
+        "Name": "CRAN",
+        "URL": "https://packages.roche.com/CRAN/2024-04-16"
+      }
+    ]
+  },
+  "Packages": {
+    "renv": {
+      "Package": "renv",
+      "Version": "1.0.7",
+      "Source": "Repository",
+      "Repository": "RSPM",
+      "Requirements": [
+        "utils"
+      ],
+      "Hash": "397b7b2a265bc5a7a06852524dabae20"
+    }
+  }
+}
